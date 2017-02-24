@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Peering matcher 0.42
+# Peering matcher 0.69
 #
 #   Written by Job Snijders <job@instituut.net>
 #
@@ -19,21 +19,10 @@
 # shell$ pip install mysql-python
 # shell$ pip install 'prettytable>0.6.1' # version 0.6.1 or later
 #
-# Since peeringdb.net does not offer a public MySQL server anymore,
-# you need a local copy of PeeringDB in MySQL. Please see
-#
-#   https://peeringdb.github.io/peeringdb-py/#how-to-install
-#
-# for details on how to create a local PeeringDB mirror.
-#
 #
 # Do not hesitate to send me patches/bugfixes/love ;-)
 
 default_asn = 8283
-mysql_host  = "localhost"
-mysql_user  = "peeringmatcher"
-mysql_pass  = "myp33r1ngs3cr3t"
-mysql_db    = "peeringdb"
 
 import sys
 from time import strftime, gmtime
@@ -42,15 +31,11 @@ import logging
 
 LOGFORMAT = '%(levelname)s: %(message)s'
 # Set level=logging.ERROR to turn off warn/info/debug noise.
-logging.basicConfig(stream=sys.stderr, format=LOGFORMAT, level=logging.WARNING)
+logging.basicConfig(stream=sys.stderr, format=LOGFORMAT, level=logging.DEBUG)
 
-try:
-    import MySQLdb
-except ImportError:
-    logging.error("module MySQLdb not found")
-    logging.warning("HINT: sudo pip install mysql-python")
-    sys.exit(2)
-
+import requests
+from collections import Counter
+from pprint import pprint
 from prettytable import *
 
 time = strftime("%Y-%m-%d %H:%M:%S", gmtime())
@@ -86,7 +71,7 @@ usage: peeringmatcher.py ASN1 [ ASN2 ] [ ASN3 ] [ etc.. ]
 
     example: ./peeringmatcher.py 8283 16509
 
-    peeringmatcher.py will do a lookup against a local PeeringDB mirror.
+    peeringmatcher.py will do a lookup against the PeeringDB-API.
     In case a single ASN is given as an argument, the program will match
     against the default_asn variable, set in the header of the script.
 
@@ -101,86 +86,60 @@ usage: peeringmatcher.py ASN1 [ ASN2 ] [ ASN3 ] [ etc.. ]
 
 class PeeringMatcher:
     def __init__(self):
-        # setup connection to local PeeringDB mirror
-        self.db = MySQLdb.connect(mysql_host, mysql_user, mysql_pass, mysql_db)
-
+        logging.info("Peering Matcher 0.69, at your service.")
+        
     def get_asn_info(self, asn_list):
         """ Get ASN info and return as dict
         """
-        cursor = self.db.cursor()
         asns = {}
+        row = {}
+        logging.debug("asn_list: %s" % (asn_list))
 
         # Fetch the ASN list
-        sql_asn_name = """
-            SELECT DISTINCT net.asn, net.name
-            FROM peeringdb_network net
-            WHERE net.asn IN (%(asns)s)
-            """ % { 'asns': ', '.join(map(str, asn_list)) }
 
-        logging.debug(sql_asn_name)
+        req = requests.get("https://peeringdb.com/api/net?asn__in=%(asns)s" % {'asns': ','.join(map(str, asn_list))}).json()['data']
 
-        cursor.execute(sql_asn_name)
+        for net in req:
+            as_name = net['name']
+            asns[net['asn']] = { 'name': net['name'] }
+            
+        for asnum in asn_list:
+            if asnum not in asns:
+                raise KeyError("Following AS does not have a PeeringDB entry: %s" % (asnum) )       
 
-        for row in cursor.fetchall():
-            logging.debug(row)
-            asn = row[0]
-            as_name = row[1]
-            asns[asn] = { 'name': as_name }
-
-        if set(asn_list) != set(asns.keys()):
-            raise KeyError("Following AS does not have a PeeringDB entry: %s" % (', '.join(map(str, set(asn_list) - set(asns.keys())))))
-
+        logging.debug("asns: %s" % (asns))
         return asns
 
 
     def get_common_pops(self, asn_list):
         """ Return a dict with common PoPs between networks
         """
-        cursor = self.db.cursor()
-
-        # Fetch common facilities
-        sql_pops = """
-            SELECT DISTINCT fac.name,
-                            net.asn
-            FROM peeringdb_ix ix
-            JOIN peeringdb_ix_facility ixfac ON ixfac.ix_id = ix.id
-            JOIN peeringdb_facility fac ON ixfac.fac_id = fac.id
-            JOIN peeringdb_network_facility netfac ON netfac.fac_id = fac.id
-            JOIN peeringdb_network net ON netfac.net_id = net.id
-            WHERE net.asn IN (%(asns)s)
-            AND fac.id IN (
-                    SELECT fac.id
-                    FROM peeringdb_facility fac
-                    JOIN peeringdb_network_facility netfac ON netfac.fac_id = fac.id
-                    JOIN peeringdb_network net ON netfac.net_id = net.id
-                    WHERE net.asn IN (%(asns)s)
-                    GROUP BY fac.id
-                    HAVING COUNT(fac.id) >= %(num_asns)s
-                    )
-            ORDER BY fac.name;
-            """ % { 'num_asns': len(asn_list), 'asns': ', '.join(map(str, asn_list)) }
-
-        logging.debug(sql_pops)
-        cursor.execute(sql_pops)
 
         pops = {}
-        for row in cursor.fetchall():
-            logging.debug(row)
-            pop_name = row[0]
-            asn = row[1]
+        commonpops = [] 
+        allpops = []
+        netfac = requests.get("https://peeringdb.com/api/netfac?local_asn__in=%(asns)s&depth=0" % {'asns': ','.join(map(str, asn_list))}).json()['data']
+        for fac in netfac:
+            allpops.append(fac['name'])
+        logging.debug("allpops: %s" % (allpops))
+        
+        commonpops = [key for key, count in Counter(allpops).iteritems() if count >= len(asn_list)]
+        logging.debug("commonpops: %s" % (commonpops))
 
+        for pop_name in commonpops:
             if pop_name not in pops:
                 pops[pop_name] = {}
-            if asn not in pops[pop_name]:
-                pops[pop_name][asn] = []
+            for asn in asn_list:
+                if asn not in pops[pop_name]:
+                    pops[pop_name][asn] = []
 
+        logging.debug("pops: %s" % (pops))
         return pops
 
 
     def get_common_ixes(self, asn_list):
         """ Return a dict with common IXes between networks
         """
-        cursor = self.db.cursor()
 
         # Fetch common facilities
         sql_ixes = """
@@ -203,27 +162,52 @@ class PeeringMatcher:
               )
             ORDER BY ixlan.id, netixlan.asn;
             """ % { 'num_asns': len(asn_list), 'asns': ', '.join(map(str, asn_list)) }
-        cursor.execute(sql_ixes)
-
-        logging.debug(sql_ixes)
 
         ixes = {}
-        for row in cursor.fetchall():
-            logging.debug(row)
-            ix_name = row[0]
-            asn = row[1]
-            local_ipaddr = row[2].strip().split('/')[0]
+        commonixes = []
+        allixes = []
+        allixlans = requests.get("https://peeringdb.com/api/netixlan?asn__in=%(asns)s&depth=0" % {'asns': ','.join(map(str, asn_list))}).json()['data']
+        logging.debug("allixlans: %s" % (allixlans))
+        for ixlan in allixlans:
+            allixes.append((ixlan['ix_id']))
+        logging.debug("allixes: %s" % (allixes))
+        
+        commonixes = [key for key, count in Counter(allixes).iteritems() if count >= len(asn_list)]
+        logging.debug("commonixes: %s" % (commonixes))
 
-            if ix_name not in ixes:
-                ixes[ix_name] = {}
-            if asn not in ixes[ix_name]:
-                ixes[ix_name][asn] = []
+        for ix_id in commonixes:
+            ixname = requests.get("https://peeringdb.com/api/ix?id=%s" % (ix_id)).json()['data'][0]['name']
+            if ixname not in ixes:
+                ixes[ixname] = {}
+            for asn in asn_list:
+                if asn not in ixes[ixname]:
+                    ixes[ixname][asn] = []
+#                if _is_ipv4(allixlans['ipaddr4']):
+#                    ixes[ixname][asn].append(ipaddr4)
+#                if _is_ipv6(ipaddr6):
+#                    ixes[ixname][asn].append(ipaddr6)
+
+
+        logging.debug("ixes: %s" % (ixes))
+        return ixes
+
+
+#        for row in cursor.fetchall():
+#            logging.debug(row)
+#            ix_name = row[0]
+#            asn = row[1]
+#            local_ipaddr = row[2].strip().split('/')[0]
+#
+#            if ix_name not in ixes:
+#                ixes[ix_name] = {}
+#            if asn not in ixes[ix_name]:
+#                ixes[ix_name][asn] = []
 
             # Peeringdb is unfortunately filled with crappy IP data. Filter the
             # shit from the database.
-            if _is_ipv4(local_ipaddr) or _is_ipv6(local_ipaddr):
-                ixes[ix_name][asn].append(local_ipaddr)
-
+        
+        
+        logging.debug("ixes: %s" % (ixes))
         return ixes
 
 
@@ -243,8 +227,6 @@ def main(asn_list):
         for asn in asns:
             ixes_header.append("AS%s - %s" % (int(asn), asns[asn]['name']))
         ixes_table = PrettyTable(ixes_header)
-
-        logging.debug(ixes)
 
         for ix_name in sorted(ixes):
             row = [ix_name]
@@ -266,7 +248,7 @@ def main(asn_list):
         for asn in asns:
             pops_header.append("AS%s - %s" % (int(asn), asns[asn]['name']))
         pops_table = PrettyTable(pops_header)
-        logging.debug(pops)
+
         for pop_name in sorted(pops):
             row = [pop_name]
             for asn in sorted(asns):
